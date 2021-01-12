@@ -34,8 +34,36 @@ struct string_intern {
     big_string_cap: int;
 };
 
-fn intern_string(s: *const char, n: int, si: *struct string_intern) -> int:
-    return 0
+fn intern_string(s: *const char, n: int, intern: *struct string_intern) -> int:
+    for var i = 0; i < intern.index_len; i++:
+        var j = intern.index[i]
+        var t = &intern.big_string[j]
+        if strlen(t) != n:
+            continue
+        if memcmp(t, s, n) != 0:
+            continue
+        return j
+
+    var j = intern.big_string_len
+    if j + n + 1 > intern.big_string_cap:
+        intern.big_string_cap += 4096
+        intern.big_string = realloc(intern.big_string, intern.big_string_cap)
+
+    memcpy(&intern.big_string[j], s, n)
+    intern.big_string[j + n] = 0
+    intern.big_string_len = j + n + 1
+
+    if intern.index_len >= intern.index_cap:
+        intern.index_cap += 32
+        intern.index = realloc(intern.index, intern.index_cap * sizeof(int))
+
+    intern.index[intern.index_len] = j
+    intern.index_len += 1
+
+    return j
+
+fn get_string(j: int, intern: *struct string_intern) -> *const char:
+    return &intern.big_string[j]
 
 enum token {
     token_fn,
@@ -126,7 +154,7 @@ fn token2string(t: enum token) -> *const char:
         case token_eof:
             return "'\\0'"
         default:
-            return NULL
+            return "undefined"
 
 fn char2token(c: char) -> enum token:
     switch c:
@@ -177,7 +205,7 @@ fn char2token(c: char) -> enum token:
 
 struct translation_unit {
     strings: struct string_intern;
-    int keywords[token_num_keywords];
+    keywords: [token_num_keywords]int;
 };
 
 struct parser {
@@ -193,10 +221,109 @@ struct parser {
     prev_indent: int;
 };
 
+var RED = "\x1b[0;31m";
+var NORMAL = "\x1b[0m";
+
+fn print_parse_error(p: *struct parser, msg: *const char) -> void:
+    var line_start = p.start
+    for ; line_start != 0 && p.text[line_start - 1] != '\n'; line_start -= 1:
+        continue
+
+    var line_end = p.end
+    for ; p.text[line_end] != '\0' && p.text[line_end] != '\n'; line_end += 1:
+        continue
+
+    var line_offset = p.start - line_start
+
+    printf("%s:%d:%d: %serror:%s %s\n", p.path, p.line_no, line_offset, RED, NORMAL, msg)
+    printf(" %4d | %.*s\n", p.line_no, line_end - line_start, &p.text[line_start])
+    printf("      | ");
+    for var i = line_start; i < p.start; i++:
+        if p.text[i] == '\t':
+            printf("\t")
+            continue
+        printf(" ")
+    printf("%s", RED)
+    for var i = p.start; i < p.end; i++:
+        printf("^")
+    printf("%s\n", NORMAL)
+
+fn bump_identifier(p: *struct parser) -> enum token:
+    while 1:
+        switch p.text[p.end]:
+            case 'a'...'z':
+            case 'A'...'Z':
+            case '0'...'9':
+            case '_':
+                p.end += 1
+                continue
+        break
+    var s = &p.text[p.start]
+    var n = p.end - p.start
+    p.string = intern_string(s, n, &p.unit.strings)
+    for var i = 0; i < token_num_keywords; i++:
+        if p.unit.keywords[i] == p.string:
+            return i
+    return token_identifier
+
+fn bump_integer_literal(p: *struct parser) -> void:
+    while 1:
+        switch p.text[p.end]:
+            case '0'...'9':
+                p.end += 1
+                continue
+        break
+    var s = &p.text[p.start]
+    var n = p.end - p.start
+    p.string = intern_string(s, n, &p.unit.strings)
+
+fn bump_string_literal(p: *struct parser) -> void:
+    p.end += 1
+    var s: [256]char
+    var n = 0
+    while 1:
+        var c = p.text[p.end]
+        if c == '\0':
+            print_parse_error(p, "unterminated string literal")
+            exit(1)
+        if c == '"':
+            p.end += 1
+            break
+        if c == '\\':
+            p.end += 1
+            var d = p.text[p.end]
+            switch d:
+                case '\0':
+                    print_parse_error(p, "unterminated string literal")
+                    exit(1)
+                case '"':
+                    c = '"'
+                    break
+                case 'n':
+                    c = '\n'
+                    break
+                case 't':
+                    c = '\t'
+                    break
+                case 'r':
+                    c = '\r'
+                    break
+                case '0':
+                    c = '\0'
+                    break
+                default:
+                    print_parse_error(p, "invalid escape sequence");
+                    exit(1)
+
+        s[n] = c
+        n += 1
+        p.end += 1
+
+    p.string = intern_string(s, n, &p.unit.strings)
+
 fn bump(p: *struct parser) -> void:
     while 1:
         p.start = p.end
-
         if p.indent == -1:
             while p.text[p.end] == ' ':
                 p.end += 1
@@ -214,23 +341,89 @@ fn bump(p: *struct parser) -> void:
 
         p.start = p.end
         p.string = 0
-        var text = &p.text[p.start]
-        var next = char2token(text[0])
-        switch next:
-            default:
-                break
 
+        var prev = p.token
+        var next = char2token(p.text[p.end])
+        switch next:
+            case token_identifier:
+                next = bump_identifier(p)
+                break
+            case token_integer_literal:
+                bump_integer_literal(p)
+                break
+            case token_string_literal:
+                bump_string_literal(p)
+                break
+            case token_lparen:
+            case token_rparen:
+            case token_lbrace:
+            case token_rbrace:
+            case token_lbracket:
+            case token_rbracket:
+            case token_colon:
+            case token_comma:
+            case token_semicolon:
+            case token_equals:
+            case token_star:
+            case token_plus:
+            case token_eof:
+                p.end += 1
+                break
+            case token_space:
+                p.end += 1
+                continue
+            case token_minus:
+                if p.text[p.end + 1] == '>':
+                    next = token_arrow
+                    p.end += 2
+                    break
+                p.end += 1
+                break
+            case token_dot:
+                if p.text[p.end + 1] == '.' &&
+                   p.text[p.end + 2] == '.':
+                    next = token_ellipsis
+                    p.end += 3
+                    break
+                p.end += 1
+                break
+            case token_eol:
+                p.indent = -1
+                while p.text[p.end] == '\n':
+                    p.line_no += 1
+                    p.end += 1
+                switch prev:
+                    case token_rparen:
+                    case token_i32:
+                    case token_identifier:
+                    case token_integer_literal:
+                        next = token_semicolon
+                        break
+                    default:
+                        continue
+                break
+            default:
+                p.end += 1
+                print_parse_error(p, "unexpected character")
+                exit(1)
+
+        p.token = next
         break
 
 fn parse_file(path: *const char, text: *const char, unit: *struct translation_unit) -> void:
     var p = (struct parser){}
     p.path = path
     p.text = text
+    p.unit = unit
     p.token = token_eof
     p.line_no = 1
 
     for bump(&p); p.token != token_eof; bump(&p):
-        printf("%-20s %2d %2d\n", "", 1, 2)
+        var s = token2string(p.token)
+        var t = (const char*)""
+        if p.string != 0:
+            t = get_string(p.string, &unit.strings)
+        printf("%-20s %2d %2d %s\n", s, p.start, p.end, t)
 
 fn main(argc: int, argv: **char) -> int:
     for var i = 1; i < argc; i++:
