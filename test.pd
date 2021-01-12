@@ -1,8 +1,8 @@
 import libc
 
 fn main(argc: i32, argv: **i8):
-    var x = 1
-    var y = x + 1
-    var z = x + y + 1
+	var x = 1
+	var y = x + 1
+	var z = x + y + 1
 
-    libc.printf("%d %d %d\n", x, y, z)
+	libc.printf("%d %d %d\n", x, y, z)
